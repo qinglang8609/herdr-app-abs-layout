@@ -189,6 +189,13 @@ exec("sh", ["-c", `cd "${dir}" 2>/dev/null || exit 0; [ -d .brain ] || abs init 
 不一样（`MACOS` 改成 `macos`），而 ssh 对大小写敏感。所以打开远程编辑器时用一条 `sh` 内联
 `awk` 去 `~/.ssh/config` 里大小写无关地找真名，找到再开。别直接拿 `machine` 当主机名。
 
+**`spin()` 必须直接作用在 `svg` 上。** 把 svg 套进一层 `div` 容器再定位，`spin()` 就不驱动它了 —— 只画出静止的弧，看不出在转。要写成
+`dot.child(svg(...).absolute().top(-2).left(-2).text_color(t.working).spin(900))`，svg 自己带定位。
+
+**`ready()` 里的时间兜底只能记一次。** 写 `(this.born[id] ??= Date.now())` 会在每次调用时重置起点，
+1.5 秒永远到不了 —— 远程机器的 git 查得慢时，整块工作区列表就停在 `Loading…`。
+要写成 `if (this.born[id] === undefined) this.born[id] = Date.now()`。
+
 **工作区图标叠压靠绘制顺序。** GPUI 里先写的画在上层，所以 `agentDots` 从正序写，左边压住右边。
 加 z-index 没用，没有这个 API。
 
