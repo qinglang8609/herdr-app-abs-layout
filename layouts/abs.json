@@ -50,20 +50,6 @@
                 "weight": 1
               },
               "min": 81
-            },
-            {
-              "id": "agents",
-              "type": "block",
-              "content": {
-                "mod": "abs",
-                "props": {
-                  "part": "agents"
-                }
-              },
-              "size": {
-                "weight": 1
-              },
-              "min": 81
             }
           ]
         }
@@ -114,7 +100,7 @@
                       },
                       "focus": {
                         "width": 1,
-                        "color": "ansi2"
+                        "color": "#4A505D"
                       },
                       "radius": 8,
                       "gap": 8

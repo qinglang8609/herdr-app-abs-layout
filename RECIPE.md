@@ -16,10 +16,9 @@
 
 - `side-top`，52px：右上角两个图标，齿轮（打开应用设置）和「收起侧栏」。
 - `spaces-bar`，98px：竖排三个入口 —— New thread、Search、Add machine。
-- 底下按高度平分两块（`weight: 1`，各最小 81px）：
-  - `spaces`：工作区列表。按机器分组（本机在最上，远程机器各一个可折叠的组头）。
-    每个工作区一行：图标 + 名字 + 运行中的 agent 圆圈 + git 分支和 ahead/behind。
-  - `agents`：正在跑的 agent，按状态分区（Needs you / Working / Idle）。
+- 底下是 `spaces`（`weight: 1`，最小 81px）：工作区列表。按机器分组（本机在最上，远程机器
+  各一个可折叠的组头）。每个工作区一行：图标 + 名字 + 运行中的 agent 圆圈 + git 分支和
+  ahead/behind。侧栏收成 rail 时，这一行的右上角是展开按钮（`»`）。
 
 **右侧工作区，占满剩余宽度，`canvas` 底色。**
 
@@ -104,8 +103,7 @@ root (row)
 │  ├─ side-top        block → mod abs, props {part:"side-top"}      px 52, window_drag
 │  ├─ spaces-bar      block → props {part:"spaces-bar"}             px 98
 │  └─ sidebar-lists (column)
-│     ├─ spaces       block → props {part:"spaces"}   weight 1, min 81
-│     └─ agents       block → props {part:"agents"}   weight 1, min 81
+│     └─ spaces       block → props {part:"spaces"}   weight 1, min 81
 └─ work (column, resizable false)
    ├─ head           block → props {part:"header"}                 px 52, window_drag
    └─ work-body (row, padding [8, 8], gap 8)
@@ -129,7 +127,6 @@ root (row)
 | `side-top` | `parts/side.js` | 齿轮 + 收起侧栏 |
 | `spaces-bar` | `parts/spaces-bar.js` | New thread / Search / Add machine |
 | `spaces` | `parts/spaces.js` | 工作区列表，分组、拖拽、agent 圆圈 |
-| `agents` | `parts/agents.js` | 运行中的 agent，按优先级分区 |
 | `header` | `parts/head.js` | 顶栏、四页按钮、打开菜单 |
 | `panel` | `parts/panel.js` | 右侧记忆库面板，四页 |
 | `open-menu` / `quick-open` / `menu` / `space-icon` | `head.js` / `menu.js` / `space-icon.js` | 各种弹层 |
