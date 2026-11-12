@@ -80,7 +80,7 @@
 **会动的**
 
 - `working` 的 agent 圆圈边缘转弧
-- 面板里的定时器：本机监听 `.brain` 目录变化，远程每 5 秒轮询一次
+- 面板里的定时器：本机监听 `.brain` 和 pi 会话目录，变了立刻刷；远程没有 watch，每 30 秒轮询一次兜底（扫描结果 25 秒内不重扫同一台机器）
 
 ## Built from
 
@@ -137,7 +137,7 @@ root (row)
 `scripts/scan.js` 是给远程机器用的扫描脚本：pi 把会话存在
 `~/.pi/agent/sessions/<slug>/<时间>_<uuid>.jsonl`，首行就有 id / timestamp / cwd，
 所以只流式读开头几百 KB 就能列出会话，不用把几 MB 读进来。本机直接跑它，
-远程把源码 base64 传过去在那台机器上跑。
+远程把源码走 stdin（heredoc）喂给那台机器上的 node 跑，不写临时文件。
 
 ### 用到的 `herdr` 函数
 

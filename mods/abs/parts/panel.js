@@ -7,6 +7,15 @@ import { spaces, panes, focused, readTextFile, writeTextFile, watchFolder, exec,
 // ── 会话（pi 历史）───────────────────────
 
 const LIMIT = 200;
+// 一次扫描最多等多久。远程机器连不上时，exec 默认等 30 秒，
+// 面板就一直卡着不显示。现在超时就当失败，接着试下一个。
+const SCAN_TIMEOUT = 12000;
+// 会话和 .brain 的轮询兜底。本机靠 watchFolder 立即刷新，只有远程机器
+// 和 watch 失效时才靠这个轮询，所以从 5 秒拉长到 30 秒，不再每 5 秒空转。
+const SESS_POLL_MS = 30000;
+const BRAIN_POLL_MS = 30000;
+// 扫到非空结果后，这么久内不再重扫同一台机器（切工作区会强制重扫）。
+const SESS_TTL_MS = 25000;
 
 // 字号：跟左侧栏（side.js / spaces.js 用 12 / 12.5 / 13）对齐，
 // 面板正文不再自留小一号。要统一调就改这五个值。
@@ -38,42 +47,33 @@ function sizeText(bytes) {
 }
 
 // 自带 UTF-8 + base64：这套运行时没有 TextEncoder / btoa。
-function utf8Bytes(str) {
-  const out = [];
-  for (let i = 0; i < str.length; i++) {
-    let c = str.charCodeAt(i);
-    if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
-      const d = str.charCodeAt(i + 1);
-      if (d >= 0xdc00 && d <= 0xdfff) {
-        c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00);
-        i++;
-      }
-    }
-    if (c < 0x80) out.push(c);
-    else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
-    else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
-    else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
-  }
-  return out;
+// node 在哪：从 Finder 启动的 Herdr 只有系统 PATH（/usr/bin:/bin:/usr/sbin:/sbin），
+// 从终端启动才带 nvm/homebrew 的路径。所以先问 PATH，再按常见安装位置兜一遍。
+function nodeSh() {
+  return `n=$(command -v node 2>/dev/null); if [ -z "$n" ]; then for c in /opt/homebrew/bin/node /usr/local/bin/node "$HOME"/.nvm/versions/node/*/bin/node; do [ -x "$c" ] && n="$c" && break; done; fi`;
 }
 
-function toBase64(str) {
-  const bytes = utf8Bytes(String(str));
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  let out = "";
-  for (let i = 0; i < bytes.length; i += 3) {
-    const a = bytes[i], b = bytes[i + 1], c = bytes[i + 2];
-    out += chars[a >> 2];
-    out += chars[((a & 3) << 4) | ((b ?? 0) >> 4)];
-    out += b === undefined ? "=" : chars[((b & 15) << 2) | ((c ?? 0) >> 6)];
-    out += c === undefined ? "=" : chars[c & 63];
-  }
-  return out;
+function nodeProbeCommand() {
+  return `${nodeSh()}; [ -n "$n" ] && printf '%s' "$n"`;
 }
 
 function remoteScanCommand(scriptText, limit) {
-  const b64 = toBase64(String(scriptText));
-  return `tmp=$(mktemp /tmp/scan-XXXXXX.js); printf %s '${b64}' | base64 -d > "$tmp" 2>/dev/null; node "$tmp" --limit ${limit}; rc=$?; rm -f "$tmp"; exit $rc`;
+  // 把脚本原样从 stdin 喂给 node：不写临时文件，不用 base64。
+  // 以前用 base64 + mktemp，在部分机器上 sh 会报
+  //   /usr/bin/base64: Operation not permitted
+  // 同一条命令在别的机器上又正常，干脆不走这条路。
+  // 定界符加引号，里面的 $ 和反引号不会被 shell 展开。
+  const text = String(scriptText).replace(/\r\n/g, "\n").replace(/\n+$/, "");
+  let tag = "__ABS_SCAN_EOF__";
+  while (text.includes(tag)) tag += "_";
+  return [
+    `h=$(uname -n 2>/dev/null)`,
+    nodeSh(),
+    `[ -n "$n" ] || { echo "没找到 node：$h" >&2; exit 127; }`,
+    `"$n" - --limit ${limit} <<'${tag}'`,
+    text,
+    tag,
+  ].join("\n");
 }
 
 // ── 解析 ─────────────────────────────────
@@ -307,10 +307,18 @@ export default class AbsPanel extends View {
     this.error = null;
     // 扫描票号：定时器和手动刷新同时触发时，只认最新一轮。
     this.scanTicket = 0;
-    // 本机有没有 node，探一次就够了。
-    this.hasNode = null;
+    // 本机的 node 绝对路径，探一次就够了。
+    this.nodeBin = null;
     // 扫描进行中标志，防止定时器和手动刷新叠跑。
     this.scanning = false;
+    // 扫描期间又被要求刷一次：跑完再补一轮，别把请求丢在 5 秒里。
+    this.scanAgain = false;
+    // 每台机器扫到的会话，非空才缓存，别每轮都重扫同一台机器。
+    this.sessCache = {};
+    // 本机 sessions 目录的监听句柄（见 watchSessions）。
+    this.watchedSessions = null;
+    // 拼好的远程扫描命令，脚本不变就别每轮都重拼。
+    this.remoteCmd = null;
     this.note = null;
     this.watched = null;
     this.watchKey = null;
@@ -345,6 +353,8 @@ export default class AbsPanel extends View {
     if (key === this.watchKey) return;
     this.watchKey = key;
     this.refresh(cx);
+    // 换了工作区或机器，会话列表也要立刻重扫，不等下一个轮询。
+    this.sessRefresh(cx, true);
   }
 
   // 只让「当前这一页」定时刷新。切走就停掉，切回来先立刻刷一次再重新起表。
@@ -361,15 +371,16 @@ export default class AbsPanel extends View {
     }
     this.stops = [];
 
-    // 先刷一次，再起 5 秒表。
+    // 先刷一次，再起轮询表。本机靠 watchFolder 立即刷新，这个表只兜底。
     this.refresh(cx);
     if (view === "sessions") this.sessRefresh(cx);
 
     const stops = [];
     if (view === "sessions") {
-      stops.push(cx.timer.every(5000, (cx) => this.sessRefresh(cx)));
+      stops.push(cx.timer.every(SESS_POLL_MS, (cx) => this.sessRefresh(cx)));
+      this.watchSessions(cx);
     } else {
-      stops.push(cx.timer.every(5000, (cx) => this.refresh(cx)));
+      stops.push(cx.timer.every(BRAIN_POLL_MS, (cx) => this.refresh(cx)));
     }
     this.stops = stops.filter(Boolean);
   }
@@ -413,7 +424,11 @@ export default class AbsPanel extends View {
         if (text != null) {
           if (file === "index.md") this.index = parseIndex(text);
           else if (file === "log.md") this.log = parseLog(text);
-          else this.todo = parseTodo(text);
+          else {
+            this.todo = parseTodo(text);
+            // 双链日志的任务跟着 todo 走：读到了就在这里触发，不在 render 里。
+            this.loadLinked(this.todo, cx);
+          }
           this.note = null;
           this.noteKind = null;
         }
@@ -500,6 +515,31 @@ export default class AbsPanel extends View {
     });
   }
 
+  // 本机 pi 会话目录一变就重扫本机，不用等 30 秒轮询。远程机器没这能力。
+  watchSessions(cx) {
+    const dir = `${home()}/.pi/agent/sessions`;
+    if (this.watchedSessions === dir) return;
+    this.watchedSessions = dir;
+    cx.spawn(async (cx) => {
+      while (this.watchedSessions === dir) {
+        let failed = false;
+        try {
+          await watchFolder(dir);
+        } catch {
+          failed = true;
+        }
+        if (this.watchedSessions !== dir) return;
+        if (!failed) {
+          // 本机会话变了：清本机缓存；当前正看本机就立即重扫。
+          delete this.sessCache["__local__"];
+          if (this.sessOn() === null) this.sessRefresh(cx, true);
+          cx.notify();
+        }
+        if (failed) await new Promise((resolve) => cx.timer.after(10000, resolve));
+      }
+    });
+  }
+
   // ── 卡片 ───────────────────────────────
 
   // `fill`: the card takes the height it is given and its own body scrolls,
@@ -507,7 +547,8 @@ export default class AbsPanel extends View {
   // `fill`: 0 keeps the card as tall as its content; above 0 the card takes
   // that share of the free height and its own body scrolls instead.
   // `footer`: pinned under the scrolling body, so paging stays put.
-  card(title, badge, body, fill = 0, footer = null) {
+  // `gap`: the space between the cards in the body; 0 makes them one flat list.
+  card(title, badge, body, fill = 0, footer = null, gap = 6) {
     const t = theme();
     return v_flex().w_full().rounded(10).overflow_hidden().bg(t.background)
       .border_1().border_color(t.border)
@@ -518,8 +559,8 @@ export default class AbsPanel extends View {
         .child(div().flex_1()))
       .child(
         fill > 0
-          ? div().flex_1().min_h(0).overflow_y_scrollbar().child(v_flex().px(4).py(5).gap(6).w_full().children(body))
-          : v_flex().px(4).py(5).gap(6).children(body),
+          ? div().flex_1().min_h(0).overflow_y_scrollbar().child(v_flex().px(4).py(5).gap(gap).w_full().children(body))
+          : v_flex().px(4).py(5).gap(gap).children(body),
       )
       .when(footer != null, (e) => e.child(footer));
   }
@@ -550,7 +591,7 @@ export default class AbsPanel extends View {
   // 平铺进「已完成」，不再只占一行「完成任务 N 条」。
   // 看板里的 `[[log-YYYY-MM-DD]]` 双链：并发读每一份 sessions/<id>.md，解析成任务。
   // 结果按 todo 的链接列表缓存，链接没变就不再读；正在读时也不再起一轮。
-  async loadLinked(todo) {
+  async loadLinked(todo, cx) {
     const links = [...(todo.doing ?? []), ...(todo.done ?? [])]
       .map((x) => x?.id)
       .filter((id) => id && String(id).startsWith("log-"));
@@ -583,7 +624,7 @@ export default class AbsPanel extends View {
     }
     this.linkedFor = key;
     this.linkedTasks = out;
-    this.lastCx?.notify?.();
+    cx?.notify?.();
   }
 
   // 双链 `[[log-YYYY-MM-DD]]` 指向 .brain/sessions/<id>.md：把里面的任务读出来，
@@ -664,7 +705,7 @@ export default class AbsPanel extends View {
       .trim();
     const detail = cleanNote && cleanNote !== task.title ? cleanNote : "";
     const kids = task.children ?? [];
-    return v_flex().w_full().flex_none().gap(3).px(7).py(6).rounded(7).bg(t.raised)
+    return v_flex().w_full().flex_none().gap(3).px(7).py(6).rounded(7)
       .cursor_pointer()
       .hover((s) => s.bg(t.chrome))
       .on_click(() => this.openDetail("task", task))
@@ -749,9 +790,6 @@ export default class AbsPanel extends View {
     // 「完成任务 N 条」这类双链行换成它指向的真实任务：去掉链接行，换成 sessions 里读到的。
     const done = (this.todo.done ?? []).filter((x) => !String(x?.id ?? "").startsWith("log-"));
     const linked = this.linkedTasks ?? [];
-    // 异步读，读到后自己 notify；这里不等它，渲染不被它拖住。
-    void this.loadLinked(this.todo ?? {});
-
     const all = [...done, ...linked];
     const PER = 20;
     const pages = Math.max(1, Math.ceil(all.length / PER));
@@ -801,6 +839,7 @@ export default class AbsPanel extends View {
       ],
       fill,
       footer,
+      0, // 看板是一整条列表：卡片之间不留空隙
     );
   }
 
@@ -820,12 +859,15 @@ export default class AbsPanel extends View {
       `${(this.index.sections ?? []).reduce((n, s) => n + (s.items.length || s.stated || 0), 0)} 页`,
       [
         ...(sections.length ? sections.map((s) => h_flex().w_full().flex_none().gap(6).items_center().px(7).py(6).rounded(7)
-          .bg(t.raised).cursor_pointer().hover((el) => el.bg(t.chrome))
+          .cursor_pointer().hover((el) => el.bg(t.chrome))
           .on_click(() => this.openDetail("section", s))
           .child(div().size(7).flex_none().rounded(4).bg(t.ansi6))
           .child(div().flex_1().min_w(0).truncate().text_size(FS_ITEM).font_semibold().text_color(t.foreground).child(s.name))
           .child(div().text_size(FS_META).text_color(t.muted).child(`${s.items.length || s.stated || 0} 页`))) : [div().px(6).text_size(FS_BODY).text_color(t.dim).child("索引为空")]),
       ],
+      0,
+      null,
+      0,
     );
   }
 
@@ -845,7 +887,7 @@ export default class AbsPanel extends View {
       `${rules.length} 条`,
       [
         ...(shown.length ? shown.map((text, i) => h_flex().w_full().flex_none().gap(6).items_center().px(7).py(6).rounded(7)
-          .bg(t.raised).hover((el) => el.bg(t.chrome))
+          .hover((el) => el.bg(t.chrome))
           .child(div().text_size(FS_META).flex_none().text_color(t.ansi6).child(`${i + 1}`))
           .child(div().flex_1().min_w(0).text_size(FS_BODY).text_color(t.foreground).child(text))
           .when(editable, (e) => e.child(div().id(`abs-rule-del-${i}`).size(18).flex_none().flex().items_center().justify_center()
@@ -865,6 +907,9 @@ export default class AbsPanel extends View {
             .on_click(() => this.addRule()).child("+ 添加铁律")
           : div().px(6).text_size(FS_META).text_color(t.dim).child(this.brainOn ? `${this.brainOn} 上的文件改不了，只能看` : "没找到 index.md"),
       ],
+      0,
+      null,
+      0,
     );
   }
 
@@ -933,7 +978,6 @@ export default class AbsPanel extends View {
             .px(7)
             .py(6)
             .rounded(7)
-            .bg(t.raised)
             .cursor_pointer()
             .hover((el) => el.bg(t.chrome))
             .on_click(() => this.openDetail("entry", e))
@@ -988,7 +1032,7 @@ export default class AbsPanel extends View {
       .child(div().text_size(FS_META).text_color(t.muted).child(`${page + 1} / ${pages}`))
       .child(btn("abs-log-next", "Next ›", page + 1, page < pages - 1));
 
-    return this.card("日志", all.length, body, fill, footer);
+    return this.card("日志", all.length, body, fill, footer, 0);
   }
 
   openIn(editor) {
@@ -1098,7 +1142,7 @@ export default class AbsPanel extends View {
       .child(div().text_size(FS_META).text_color(t.muted).child(`${page + 1} / ${pages}`))
       .child(btn("abs-sess-next", "Next ›", page + 1, page < pages - 1));
 
-    return [this.card(this.machine ? `pi 会话 · ${this.machine}` : "pi 会话", list.length, body, 1, footer)];
+    return [this.card(this.machine ? `pi 会话 · ${this.machine}` : "pi 会话", list.length, body, 1, footer, 0)];
   }
 
   sessTargets() {
@@ -1114,28 +1158,40 @@ export default class AbsPanel extends View {
     return out;
   }
 
+  // 拼好的远程扫描命令：脚本不变就别每轮都重拼 3.7KB 字符串。
+  remoteCmdFor() {
+    if (this.remoteCmd?.script === this.scriptText) return this.remoteCmd.cmd;
+    const cmd = remoteScanCommand(this.scriptText, LIMIT);
+    this.remoteCmd = { script: this.scriptText, cmd };
+    return cmd;
+  }
+
   async sessScanOn(on) {
     if (on) {
       if (!this.scriptText) throw new Error("脚本还没读到");
-      const r = await exec("sh", ["-c", remoteScanCommand(this.scriptText, LIMIT)], { on });
+      const r = await exec("sh", ["-c", this.remoteCmdFor()], { on, timeout: SCAN_TIMEOUT });
       if (r.code !== 0) throw new Error((r.stderr || r.stdout || "扫描失败").trim().slice(0, 160));
       return JSON.parse((r.stdout || "").trim() || "{}").sessions ?? [];
     }
     // 本机没装 node 就跳过，不算错误。探一次就够了，不用每轮都探。
-    if (this.hasNode === null) {
-      const probe = await exec("sh", ["-c", "command -v node >/dev/null 2>&1 && echo ok || echo missing"]);
-      this.hasNode = (probe.stdout || "").trim() === "ok";
+    if (this.nodeBin === null) {
+      const probe = await exec("sh", ["-c", nodeProbeCommand()], { timeout: 8000 });
+      this.nodeBin = (probe.stdout || "").trim();
     }
-    if (!this.hasNode) return [];
+    if (!this.nodeBin) return [];
     const path = this.scriptPath || this.scanScriptCandidates()[0];
-    const r = await exec("node", [path, "--limit", String(LIMIT)]);
+    const r = await exec(this.nodeBin, [path, "--limit", String(LIMIT)], { timeout: SCAN_TIMEOUT });
     if (r.code !== 0) throw new Error((r.stderr || r.stdout || "扫描失败").trim().slice(0, 160));
     return JSON.parse((r.stdout || "").trim() || "{}").sessions ?? [];
   }
 
-  sessRefresh(cx) {
-    // 上一轮还没跑完就跳过。远程扫描要几秒，10 秒定时器很容易叠在一起。
-    if (this.scanning) return;
+  sessRefresh(cx, force = false) {
+    // 上一轮还没跑完就记一笔，等它跑完再补一轮。远程扫描要几秒，定时器和
+    // 切工作区很容易撞在一起；直接丢掉就是「切了要等下一个轮询」。
+    if (this.scanning) {
+      this.scanAgain = true;
+      return;
+    }
     this.scanning = true;
     const ticket = ++this.scanTicket;
     cx.spawn(async (cx) => {
@@ -1143,9 +1199,17 @@ export default class AbsPanel extends View {
       let got = null;
       try {
         for (const t of this.sessTargets()) {
+          const key = t.on ?? "__local__";
+          const hit = this.sessCache[key];
+          // 非空缓存没过期就直接用，别每轮都重扫同一台机器。
+          if (!force && hit?.list?.length && Date.now() - hit.at < SESS_TTL_MS) {
+            got = { on: t.on, list: hit.list };
+            break;
+          }
           try {
             const list = await this.sessScanOn(t.on);
             if (list.length) {
+              this.sessCache[key] = { list, at: Date.now() };
               got = { on: t.on, list };
               break;
             }
@@ -1157,11 +1221,21 @@ export default class AbsPanel extends View {
         this.sessions = got?.list ?? [];
         this.machine = got?.on ?? null;
         // 扫到东西就不报错；一条都没扫到才把原因说出来。
-        this.error = got ? null : errors.join("；") || null;
+        // 扫到的不是当前机器，说明当前机器那轮出错了，把原因一起带上，
+        // 否则界面只显示别的机器的会话，看不出为什么。
+        const want = this.sessOn();
+        const fell = !!got && (got.on ?? null) !== (want ?? null);
+        this.error = got
+          ? (fell && errors.length ? `${want ?? "这台机器"}没扫成：${errors[0]}` : null)
+          : errors.join("；") || null;
       } finally {
         // 不管成没成都要放开，否则一次异常就永远不再扫了。
         this.scanning = false;
         cx.notify();
+        if (this.scanAgain) {
+          this.scanAgain = false;
+          this.sessRefresh(cx);
+        }
       }
     });
   }
@@ -1203,8 +1277,9 @@ export default class AbsPanel extends View {
     const safe = String(s.file).replace(/'/g, "'\\''");
     const done = (msg) => {
       // 先把结果记下来再刷新，否则 sessRefresh 会把错误覆盖掉。
+      // 刚删了文件，强制重扫，别拿缓存里还带着被删会话的旧列表。
       if (msg) this.error = msg;
-      this.sessRefresh(cx);
+      this.sessRefresh(cx, true);
     };
     exec("sh", ["-c", `rm -f -- '${safe}'`], on ? { on } : undefined)
       .then(() => done(null))
@@ -1231,7 +1306,7 @@ export default class AbsPanel extends View {
       .pr(28)
       .py(7)
       .rounded(7)
-      .bg(arming ? t.ansi1 : t.raised)
+      .when(arming, (e) => e.bg(t.ansi1))
       .cursor_pointer()
       .hover((el) => el.bg(arming ? t.ansi1 : t.chrome))
       .on_hover((h, cx) => {
