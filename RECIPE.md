@@ -115,7 +115,19 @@ root (row)
             └─ abs  block → mod abs, props {part:"panel"}
 ```
 
-### 一个 mod：`mods/abs/`
+### 四个 mod
+
+| mod | 干什么 |
+|---|---|
+| `mods/abs` | 主界面：侧栏、顶栏、右侧四页面板 |
+| `mods/files-mine` | 文件树；点文件弹窗看内容 |
+| `mods/changes-mine` | Git 面板：多仓库、暂存/取消暂存/丢弃、提交、推拉、分支图历史 |
+| `mods/agent2api` | 侧栏底部统计块：Token / 请求 / 缓存命中 / 账号可用 / 可用积分 |
+
+内置的 `files` 和 `changes` 每次启动会被 app 按哈希重置，改不动它们的行为，
+所以这两份是独立模块，`layouts/abs.json` 里直接指向它们。
+
+#### `mods/abs/`
 
 `mod.json` 是 `{ "place": "none", "title": "abs" }` —— `place: none` 表示它不自动占位，
 完全靠布局里的 `props.part` 选块。
@@ -231,11 +243,24 @@ abs init
 ```sh
 mkdir -p ~/.config/herdr-app/{layouts,mods}
 cp layouts/abs.json ~/.config/herdr-app/layouts/
-cp -R mods/abs ~/.config/herdr-app/mods/
+for m in abs agent2api changes-mine files-mine; do
+  rm -rf ~/.config/herdr-app/mods/$m
+  cp -R mods/$m ~/.config/herdr-app/mods/
+done
 
 herdr-app check ~/.config/herdr-app/mods/abs
 herdr-app do layout.switch '{"name":"abs"}'
 ```
+
+统计块要读自己搭的面板，凭据放 `~/.config/herdr-app/agent2api.json`（600 权限）：
+
+```sh
+cp agent2api.example.json ~/.config/herdr-app/agent2api.json
+chmod 600 ~/.config/herdr-app/agent2api.json
+# 填 base / username / password
+```
+
+没这个文件、或没填账号密码时，统计块整块不显示，其它三块照常。
 
 `herdr-app check` 应该输出 `check passed`。切换布局后原来的布局还在，`ctrl-shift-l` 切回去，
 删掉这两个文件就等于卸载。
