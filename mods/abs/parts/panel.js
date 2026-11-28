@@ -630,6 +630,7 @@ export default class AbsPanel extends View {
     this.brainOn = null;
     this.todo = { doing: [], done: [] };
     this.index = { sections: [], rules: [] };
+    this.indexOpen = {};   // 图谱页展开了哪几个分类
     this.log = [];
     this.logPage = 0;
     this.logScroll = ScrollHandle.new(); // 翻页后用它把列表拉回顶部
@@ -686,6 +687,12 @@ export default class AbsPanel extends View {
         if (cmd === "open-zed") this.openIn("zed");
         else if (cmd === "open-code") this.openIn("code");
         else if (cmd.startsWith("rule-add:")) this.addRuleText(cmd.slice("rule-add:".length));
+        else if (cmd.startsWith("rule-edit:")) {
+          // 形如 rule-edit:<行号>:<新文本>，文本里可能带冒号，只在第一个冒号处切开。
+          const rest = cmd.slice("rule-edit:".length);
+          const at = rest.indexOf(":");
+          if (at > 0) this.editRuleText(Number(rest.slice(0, at)), rest.slice(at + 1));
+        }
         cx.notify();
       }
     });
@@ -1129,40 +1136,81 @@ export default class AbsPanel extends View {
         this.toggleLog(item.id, this.lastCx);
         return;
       }
-      // 跟行格式同一个顺序：时间 → 作者 → 标签 → 会话 id → 状态/结论。
-      const meta = [item.date, item.who, ...(item.tags ?? []), item.id, item.state, item.verdict].filter(Boolean);
-      // 详情正文：先父任务那一行原文，再跟着子项（按文件里的缩进和勾选字符写回去）。
-      const body = [
-        item.line ?? "",
-        ...(item.children ?? []).map((k) => `  - [${k.mark || (k.done ? "x" : " ")}] ${k.text}`),
-      ];
+      // 和看板行同款格式：状态点、结论、日期、标签、描述、子项。不再丢原文件行。
+      const dotColor = item.verdict === "落地" ? TINT.green
+        : item.verdict === "否决" ? TINT.red
+        : item.verdict === "仅方案" ? TINT.gold
+        : this.stateColor(t, item);
       openOverlay({
         mod: "abs-detail", kind: "dialog", width: 620, height: 460,
-        props: { title: item.title, meta, body },
-      });
-      return;
-    }
-    if (kind === "section") {
-      openOverlay({
-        mod: "abs-detail", kind: "dialog", width: 640, height: 520,
         props: {
-          title: item.title || item.name,
-          meta: [`${item.items.length} 条`],
-          body: item.items.length
-            ? item.items.map((x) => `- [[${x.name}]]${x.about ? " — " + x.about : ""}`)
-            : ["这个分类下还没有条目。"],
+          title: item.title,
+          view: "task",
+          dotColor,
+          dotSolid: item.verdict != null,
+          state: item.state,
+          verdict: item.verdict,
+          when: dateShort(item.date),
+          who: item.who,
+          tags: item.tags ?? [],
+          id: item.id,
+          note: (item.note ?? "").replace(/\s+/g, " ").trim(),
+          kids: (item.children ?? []).map((k) => ({ text: k.text, done: k.done, color: kidColor(t, k) })),
         },
       });
       return;
     }
+    if (kind === "page") { this.openPage(item); return; }
+    // 日志条目：和日志行同款——金点、标题、日期、作者·类型·标签，下面正文。
     openOverlay({
       mod: "abs-detail", kind: "dialog", width: 640, height: 420,
       props: {
         title: item.title || item.text.split("\n")[0] || "(空)",
-        meta: [item.when, item.who, ...(item.tags ?? []), item.id, item.kind].filter(Boolean),
-        body: [item.line ?? ""],
+        view: "log",
+        dotColor: TINT.gold,
+        dotSolid: true,
+        when: dateShort(item.when),
+        who: item.who,
+        kind: item.kind,
+        tags: item.tags ?? [],
+        id: item.id,
+        body: String(item.text || item.line || "").split("\n"),
       },
     });
+  }
+
+  // 图谱页里的一页：读那份 .md 原文，整份丢进弹窗。读不到也弹，正文写明找过的路径。
+  async openPage(item) {
+    const base = this.brainDir;
+    const on = this.brainOn;
+    const file = base ? await this.pagePath(base, on, item.name, item.section) : null;
+    if (!file) {
+      openOverlay({
+        mod: "abs-detail", kind: "dialog", width: 560, height: 160,
+        props: { title: item.name, meta: [item.section].filter(Boolean), body: [`没找到这份文档：${base ?? ".brain"} 下没有 ${item.name}.md`] },
+      });
+      return;
+    }
+    openOverlay({
+      mod: "abs-detail", kind: "dialog", modal: true, width: 780, height: 640,
+      props: { page: true, path: file, on, section: item.section, title: item.name },
+    });
+  }
+
+  // 条目名 → 文件路径：先拿分类名当目录名猜（concepts/、sources/…），
+  // 猜不中再在 .brain 里找两层内的同名 .md。查到的缓存住，重复点不再 find。
+  async pagePath(base, on, name, section) {
+    this.pagePaths ??= {};
+    const key = `${base}|${name}`;
+    if (key in this.pagePaths) return this.pagePaths[key];
+    const guess = section ? `${base}/${String(section).toLowerCase()}/${name}.md` : null;
+    let file = guess && (await readTextFile(guess, { on }).catch(() => null)) != null ? guess : null;
+    if (!file) {
+      const r = await exec("sh", ["-c", 'find "$1" -maxdepth 2 -type f -name "$2.md" 2>/dev/null | head -1', "find", base, String(name)], { on }).catch(() => null);
+      file = String(r?.stdout ?? "").trim() || null;
+    }
+    this.pagePaths[key] = file;
+    return file;
   }
 
   // 一条任务：左边圆圈、标题单行省略、时间靠右，注释缩进在下一行。
@@ -1337,18 +1385,32 @@ export default class AbsPanel extends View {
     const t = theme();
     // index.md 里出现的每个 ## 分类都列出来，空的也列（显示 0 页），
     // 不按名字排除、也不因没条目就吞掉。
+    // 两层：分类一行，默认折叠；点分类展开它底下的页，再点收回去，点页弹文档内容。
     const sections = this.index.sections ?? [];
+    const open = this.indexOpen ?? {};
+    const rows = sections.flatMap((s, i) => [
+      h_flex().w_full().flex_none().gap(7).items_center().px(7).py(5).rounded(8)
+        .cursor_pointer().hover((el) => el.bg(t.chrome))
+        .on_click((_e, cx) => {
+          this.indexOpen = { ...open, [s.name]: !open[s.name] };
+          cx.notify();
+        })
+        .child(div().size(10).flex_none().rounded(5).bg(TINTS[i % TINTS.length]))
+        .child(div().flex_1().min_w(0).truncate().text_size(FS_ITEM).font_medium().text_color(t.foreground).child(s.name))
+        .child(div().text_size(FS_META).text_color(t.dim).child(`${s.items.length || s.stated || 0} pages`))
+        .child(div().size(12).flex_none().text_size(FS_META).text_color(t.dim).child(open[s.name] ? "▾" : "▸")),
+      // 第二层：展开后缩进列出页，对齐分类名（点 10 + 间距 7 + 内边距 7）。
+      ...(open[s.name] ? s.items.map((x) => v_flex().w_full().flex_none().gap(1).pl(24).pr(7).py(4).rounded(8)
+        .cursor_pointer().hover((el) => el.bg(t.chrome))
+        .on_click(() => this.openDetail("page", { ...x, section: s.name }))
+        .child(div().w_full().min_w(0).truncate().text_size(FS_BODY).text_color(t.foreground).child(x.name))
+        .when(Boolean(x.about), (el) =>
+          el.child(div().w_full().min_w(0).truncate().text_size(FS_META).text_color(t.dim).child(x.about)))) : []),
+    ]);
     return this.card(
       "Index",
-      `${(this.index.sections ?? []).reduce((n, s) => n + (s.items.length || s.stated || 0), 0)} pages`,
-      [
-        ...(sections.length ? sections.map((s, i) => h_flex().w_full().flex_none().gap(7).items_center().px(7).py(5).rounded(8)
-          .cursor_pointer().hover((el) => el.bg(t.chrome))
-          .on_click(() => this.openDetail("section", s))
-          .child(div().size(10).flex_none().rounded(5).bg(TINTS[i % TINTS.length]))
-          .child(div().flex_1().min_w(0).truncate().text_size(FS_ITEM).font_medium().text_color(t.foreground).child(s.name))
-          .child(div().text_size(FS_META).text_color(t.dim).child(`${s.items.length || s.stated || 0} pages`))) : [div().px(6).text_size(FS_BODY).text_color(t.dim).child("索引为空")]),
-      ],
+      `${sections.reduce((n, s) => n + (s.items.length || s.stated || 0), 0)} pages`,
+      [...(rows.length ? rows : [div().px(6).text_size(FS_BODY).text_color(t.dim).child("索引为空")])],
       1, // 撑满剩下的高度，分类多的时候在卡片里滚
       null,
       0,
@@ -1361,7 +1423,7 @@ export default class AbsPanel extends View {
     // 没有铁律段也照样显示这张卡，只是上面写「还没有铁律」。
     const rules = this.index.rules ?? [];
     // writeTextFile 只能写本机，远程的 index.md 改不了。
-    const editable = !this.brainOn && Boolean(this.brainDir);
+    const editable = Boolean(this.brainDir);
     // 默认只摆前 3 条，多的收起来；点「全部」展开。删行按原编号，展开不展开都对。
     const LIMIT = 3;
     const expanded = this.rulesOpen === true;
@@ -1371,12 +1433,14 @@ export default class AbsPanel extends View {
       "Rules",
       `${rules.length}`,
       [
-        ...(shown.length ? shown.map((text, i) => h_flex().w_full().flex_none().gap(7).items_center().px(7).py(5).rounded(8)
+        ...(shown.length ? shown.map((text, i) => h_flex().id(`abs-rule-${i}`).w_full().flex_none().gap(7).items_center().px(7).py(5).rounded(8)
           .hover((el) => el.bg(t.chrome))
+          .when(editable, (e) => e.cursor_pointer().on_click(() => this.editRule(i)))
           .child(div().text_size(FS_META).flex_none().w(12).text_color(t.dim).child(`${i + 1}`))
           .child(div().flex_1().min_w(0).truncate().text_size(FS_BODY).text_color(t.foreground).child(text))
           .when(editable, (e) => e.child(div().id(`abs-rule-del-${i}`).size(18).flex_none().flex().items_center().justify_center()
             .rounded(5).text_size(FS_BODY).text_color(t.dim).cursor_pointer()
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
             .hover((s) => s.bg(t.hover).text_color(t.ansi1))
             .on_click(() => this.removeRule(i)).child("×")))) : [div().px(6).text_size(FS_BODY).text_color(t.dim).child("还没有铁律")]),
         ...(hidden > 0 ? [h_flex().id("abs-rule-more").h(22).px(6).flex_none().items_center().text_size(FS_META).text_color(t.dim)
@@ -1390,7 +1454,7 @@ export default class AbsPanel extends View {
             .text_size(FS_BODY).text_color(t.dim).cursor_pointer()
             .hover((s) => s.bg(t.chrome).text_color(t.foreground))
             .on_click(() => this.addRule()).child("+ 添加铁律")
-          : div().px(6).text_size(FS_META).text_color(t.dim).child(this.brainOn ? `${this.brainOn} 上的文件改不了，只能看` : "没找到 index.md"),
+          : div().px(6).text_size(FS_META).text_color(t.dim).child(this.brainOn ? `${this.brainOn} · 远程可直接改` : "没找到 index.md"),
       ],
       0,
       null,
@@ -1400,15 +1464,25 @@ export default class AbsPanel extends View {
 
   // 改 index.md 的 Rules 段：先整份读下来，换掉这一段，再整份写回。
   async editRules(change) {
-    if (this.brainOn || !this.brainDir) return;
+    if (!this.brainDir) return;
     const path = `${this.brainDir}/index.md`;
     try {
-      const text = await readTextFile(path).catch(() => null);
+      const text = await readTextFile(path, { on: this.brainOn }).catch(() => null);
       if (text == null) { this.note = "读不到 index.md"; this.noteKind = "open"; return; }
       const next = change(text);
       if (next === text) return;
-      // expected 传原文：这期间文件被別处改了，写入会被拒绝，不会覆盖别人的改动。
-      await writeTextFile(path, next, text);
+      if (this.brainOn) {
+        // 远程：先重读确认没被别人改过，再走 sh + heredoc 写回（writeTextFile 只管本机）。
+        const cur = await readTextFile(path, { on: this.brainOn });
+        if (cur !== text) throw new Error("文件在远程已被别人改过，保存拒绝");
+        // 先写同目录临时文件再 mv：中途断连不会留下半截 index.md（mv 同盘是原子的）。
+        const d = "ABS_EOF_" + Math.random().toString(36).slice(2, 10);
+        const r = await exec("sh", ["-c", `t="$1.tmp.$$"; cat > "$t" <<'${d}'\n${next}\n${d}\nrc=$?; if [ "$rc" -eq 0 ]; then mv -f "$t" "$1"; else rm -f "$t"; fi; exit $rc`, "abs-rules", path], { on: this.brainOn });
+        if (!r || r.code !== 0) throw new Error((r?.stderr || "写入失败").trim().slice(0, 120) || "写入失败");
+      } else {
+        // expected 传原文：这期间文件被別处改了，写入会被拒绝，不会覆盖别人的改动。
+        await writeTextFile(path, next, text);
+      }
       this.note = null;
       this.noteKind = null;
       this.refresh(this.lastCx);
@@ -1420,13 +1494,29 @@ export default class AbsPanel extends View {
 
   addRule() {
     openOverlay({
-      mod: "abs-detail", kind: "dialog", width: 520, height: 240,
+      mod: "abs-detail", kind: "dialog", width: 480, height: 190,
       props: {
         title: "添加铁律",
         meta: ["写入 index.md 的 ## Rules"],
         input: { placeholder: "一句话说清这条规矩" },
         submitLabel: "添加",
         submit: { name: "abs-panel.rule-add" },
+      },
+    });
+  }
+
+  // 点一条铁律：同一个弹窗，输入框里预先填好原文，保存时按行号替换。
+  editRule(i) {
+    const text = (this.index.rules ?? [])[i];
+    if (text == null) return;
+    openOverlay({
+      mod: "abs-detail", kind: "dialog", width: 480, height: 190,
+      props: {
+        title: "编辑铁律",
+        meta: [`第 ${i + 1} 条`, "改完写回 index.md 的 ## Rules"],
+        input: { placeholder: "一句话说清这条规矩", value: text },
+        submitLabel: "保存",
+        submit: { name: `abs-panel.rule-edit:${i}` },
       },
     });
   }
@@ -1441,8 +1531,15 @@ export default class AbsPanel extends View {
     this.editRules((text) => rebuildRules(text, (cur) => (cur.includes(line) ? cur : [...cur, line])));
   }
 
+  // 编辑第 i 条：换成新文本；改空了等于删掉那条。
+  editRuleText(i, value) {
+    const line = String(value ?? "").trim();
+    this.editRules((text) => rebuildRules(text, (cur) =>
+      line ? cur.map((r, j) => (j === i ? line : r)) : cur.filter((_, j) => j !== i)));
+  }
+
   // 日志：左边一根竖线当时间轴，最新那条是实心节点，其余是空心环。
-  // 一行 = 序号 + 时间 / 标题（可换行）/ 作者·类型·标签 / 正文摘要。
+  // 一行 = 标题（可换行）/ 作者·时间·类型·标签 / 正文摘要。
   logCard(fill = 1) {
     const t = theme();
     const all = this.log ?? [];
@@ -1456,7 +1553,7 @@ export default class AbsPanel extends View {
 
     const body = entries.length
       ? entries.map((e, k) => {
-          const i = start + k; // 全列表里的位置：序号和“最新”都按它算
+          const i = start + k; // 全列表里的位置：“最新”按它算，翻到第二页就没有最新了
           // 新格式的标题写在方括号里，正文在方括号外；
           // 老格式（`## [时间] [[作者]] 类型 | 正文`）就从正文里截首句当标题。
           let title = e.title || "";
@@ -1467,7 +1564,7 @@ export default class AbsPanel extends View {
             title = stop > 0 ? head.slice(0, stop + 1) : head;
             detail = stop > 0 ? head.slice(stop + 1).trim() : "";
           }
-          const meta = [e.who, e.kind, ...(e.tags ?? [])].filter(Boolean).join(" · ");
+          const meta = [e.who, dateShort(e.when), e.kind, ...(e.tags ?? [])].filter(Boolean).join(" · ");
           // 最新那条给个实心金点，历史的是空心环。
           const node = i === 0
             ? div().size(10).flex_none().rounded(5).bg(TINT.gold)
@@ -1488,20 +1585,13 @@ export default class AbsPanel extends View {
             )
             .child(
               v_flex().flex_1().min_w(0).gap(2).px(7).py(5)
-                // 第一行：序号 + 时间
-                .child(
-                  h_flex().w_full().gap(6).items_center()
-                    .child(div().flex_none().text_size(FS_META).text_color(t.dim).child(`#${total - i}`))
-                    .child(div().flex_none().text_size(FS_META).text_color(t.dim).child(dateShort(e.when)))
-                    .child(div().flex_1()),
-                )
-                // 第二行：标题，允许换行
+                // 第一行：标题，允许换行
                 .child(div().w_full().min_w(0).text_size(FS_ITEM).font_medium().text_color(t.foreground).child(title))
-                // 第三行：作者 · 类型 · 标签
+                // 第二行：作者 · 时间 · 类型 · 标签
                 .when(Boolean(meta), (el) =>
                   el.child(div().w_full().min_w(0).truncate().text_size(FS_META).text_color(t.muted).child(meta)),
                 )
-                // 第四行：正文摘要，一行省略
+                // 第三行：正文摘要，一行省略
                 .when(Boolean(detail), (el) =>
                   el.child(div().w_full().min_w(0).truncate().text_size(FS_META).text_color(t.dim).child(detail)),
                 ),
@@ -1584,6 +1674,8 @@ export default class AbsPanel extends View {
     const page = Math.min(Math.max(0, this.sessPage ?? 0), pages - 1);
     this.sessPage = page;
     const shown = list.slice(page * PER, page * PER + PER);
+    // 只给这一页的会话数 token；缓存按文件 + mtime，没变就不重算。
+    this.sessTokens(cx, shown);
 
     const body = shown.length
       ? shown.map((x) => this.sessRow(x, bg))
@@ -1820,16 +1912,16 @@ export default class AbsPanel extends View {
           .child(node)
           .child(div().flex_1().min_w(0).truncate().text_size(FS_ITEM).font_medium().text_color(arming ? t.background : t.foreground).child(title)),
       )
-      // 第二行：时间在左、token 在右，缩进对齐标题
+      // 第二行：token 在左、时间跟在后面，缩进对齐标题
       .child(
         h_flex()
           .w_full()
           .gap(6)
           .items_center()
           .pl(17)
-          .child(div().text_size(FS_META).text_color(t.dim).child(whenText(s.mtime)))
-          .child(div().flex_1())
-          .child(div().flex_none().text_size(FS_META).text_color(t.dim).child(tokensText(tk))),
+          .child(div().flex_none().text_size(FS_META).text_color(t.dim).child(tokensText(tk)))
+          .child(div().flex_none().text_size(FS_META).text_color(t.dim).child(whenText(s.mtime)))
+          .child(div().flex_1()),
       )
       // 删除按钮：平时藏着，鼠标落在这一行时在右侧垂直居中冒出来。无背景、不变色。
       .child(
